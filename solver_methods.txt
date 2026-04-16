@@ -1,0 +1,313 @@
+================================================================================
+  SOLVER METHOD GUIDE
+================================================================================
+
+  Applies to: rcs_solver.py, fmm_helmholtz_2d.py, fmm_near.c
+  Setting:    SOLVER_METHOD in run_solver.py, or solver_method= in API calls
+  GUI:        Advanced Settings → Solver Method dropdown
+
+
+================================================================================
+  THE THREE METHODS
+================================================================================
+
+DIRECT (LU)
+────────────
+  What it does:
+    Assembles the full N×N dense matrix, then factors it using LU
+    decomposition (Gaussian elimination with pivoting). Once factored,
+    each additional incidence angle is solved by back-substitution,
+    which is essentially free.
+
+  Cost breakdown:
+    Assembly:        O(N²)  — every panel pair evaluated
+    Factorization:   O(N³)  — the dominant cost for large N
+    Per-angle solve: O(N²)  — back-substitution, negligible
+
+  When to use it:
+    - N < 2000 panels (any geometry, any material)
+    - Sweeping many angles at one frequency (50+ angles)
+    - You want machine-precision residuals (10⁻¹⁵)
+    - You need the condition number for diagnostics
+
+  When to avoid it:
+    - N > 3000 — factorization becomes minutes to hours
+    - Memory constrained — stores full N×N complex matrix (128 bytes per entry)
+      N=5000 → 200 MB, N=10000 → 800 MB
+
+  Set it:
+    SOLVER_METHOD = "direct"
+    or solver_method="direct" in API calls
+
+  What you see:
+    - Residuals at machine precision (10⁻¹⁵ to 10⁻¹⁴)
+    - All angles at one frequency take about the same total time
+    - The solver prints "direct" in the metadata
+
+
+GMRES (Iterative)
+──────────────────
+  What it does:
+    Assembles the full N×N dense matrix (same as LU), then solves
+    iteratively using GMRES (Generalized Minimal Residual). Each
+    iteration multiplies the matrix by a vector and updates the
+    solution estimate. Converges when the residual drops below 10⁻¹⁰.
+
+  Cost breakdown:
+    Assembly:        O(N²)  — same as direct
+    Per-angle solve: O(N² × n_iter) — typically 20-100 iterations
+    No factorization step
+
+  When to use it:
+    - N > 3000 where LU factorization is too slow
+    - Few angles per frequency (1-10 angles)
+    - The system is well-conditioned (PEC, simple shapes)
+
+  When to avoid it:
+    - Many angles — each angle needs a fresh GMRES solve
+    - Poorly conditioned systems — GMRES may not converge
+    - You need exact residuals — GMRES gives 10⁻¹⁰ not 10⁻¹⁵
+
+  Set it:
+    SOLVER_METHOD = "gmres"
+    or solver_method="gmres" in API calls
+
+  What you see:
+    - Residuals around 10⁻⁶ to 10⁻¹⁰
+    - If GMRES fails to converge, the solver falls back to LU
+      and prints a warning
+    - Assembly time is the same as LU (the matrix is still built)
+
+
+FMM (Fast Multipole Method)
+─────────────────────────────
+  What it does:
+    Does NOT assemble the full dense matrix. Instead builds:
+    1. A quadtree over the panel centers
+    2. Multipole expansion coefficients for far-field interactions
+    3. A cached near-field matrix (only close panel pairs, ~15-30% of all)
+    Then solves with GMRES, where each iteration uses the FMM for the
+    matrix-vector product instead of a dense multiply.
+
+  Cost breakdown:
+    Tree + near-field build: O(N) to O(N^1.5)
+    Per-angle solve:         O(N log N × n_iter)
+
+  When to use it:
+    - N > 1000 panels (TM PEC/IBC)
+    - N > 1500 panels (multi-region with complex materials)
+    - Memory constrained — near-field matrix is much smaller than full
+    - High frequency runs where dense assembly exceeds 5 minutes
+
+  When to avoid it:
+    - N < 500 — overhead exceeds benefit
+    - Many angles at one frequency — each angle needs fresh GMRES
+    - TE PEC — not yet implemented, falls back to dense with a warning
+
+  Set it:
+    SOLVER_METHOD = "fmm"
+    or solver_method="fmm" in API calls
+
+  What you see:
+    - Residuals around 10⁻⁶ to 10⁻¹⁰ (GMRES tolerance)
+    - Build time message before the solve starts
+    - For TE PEC, a warning that FMM fell back to dense
+    - RCS accuracy identical to dense (validated to 0.001 dB vs Mie)
+
+
+AUTO
+────
+  What it does:
+    Picks between LU and GMRES based on system size:
+    - N < 3000 DOFs → LU (direct)
+    - N ≥ 3000 DOFs → GMRES
+
+    Auto does NOT currently select FMM. You must request FMM explicitly.
+
+  Set it:
+    SOLVER_METHOD = "auto"    (this is the default)
+
+
+================================================================================
+  WHICH FORMULATIONS SUPPORT WHICH METHODS
+================================================================================
+
+  Formulation              LU    GMRES   FMM
+  ─────────────────────    ───   ─────   ───
+  TM PEC (Robin MFIE)      ✓      ✓      ✓
+  TM IBC (Robin MFIE)      ✓      ✓      ✓
+  TM PEC+IBC               ✓      ✓      ✓
+  TE PEC (coupled CFIE)    ✓      ✓      ✗ (falls back to LU)
+  TE IBC                   ✓      ✓      ✗ (falls back to LU)
+  Single dielectric        ✓      ✓      ✗ (falls back to LU)
+  Multi-region (coated)    ✓      ✓      ✓ (operators validated,
+                                              GMRES convergence
+                                              depends on geometry)
+
+  Your fin_bumper geometry routes to the multi-region solver for both
+  TE and TM. FMM operators are built and validated for this path, but
+  GMRES convergence at small panel counts (< 600) is slower than LU.
+  At 1000+ panels, FMM will be faster.
+
+
+================================================================================
+  THE C BACKEND (fmm_near.so)
+================================================================================
+
+What it does:
+  The C extension accelerates the near-field block computation inside
+  the FMM. Each near-field panel pair requires evaluating the Hankel
+  function H₀ and H₁ at quadrature points. The C code does this using
+  the C math library's j0(), y0(), j1(), y1() functions, which are
+  18× faster than the equivalent Python/scipy calls.
+
+When it is used:
+  The C extension is ONLY used when ALL of these conditions are met:
+    1. solver_method = "fmm"
+    2. The wavenumber k is real (zero imaginary part)
+    3. The panel pair is "regular" (not self-interaction, not touching)
+    4. The file fmm_near.so exists in the working directory or next
+       to fmm_helmholtz_2d.py
+
+  Condition 2 means the C extension is used for:
+    - Air-side operators (k₀ is always real)
+    - PEC-only geometries (all operators use k₀)
+
+  It is NOT used for:
+    - Interior operators with lossy materials (complex k)
+    - Self-interaction blocks (need recursive singular quadrature)
+    - Touching panel pairs (need Duffy-type quadrature)
+
+  For your fin_bumper, the C extension handles 3 of the 8 operator pairs
+  (the air-wavenumber ones). The other 5 use the Python vectorized batch
+  with scipy.special.hankel2, which handles complex arguments.
+
+What happens without it:
+  If fmm_near.so is missing, the FMM still works. The near-field for
+  real-k regular pairs falls back to the Python vectorized batch (same
+  code path as complex-k pairs). This is about 2-3× slower for those
+  pairs but produces identical results.
+
+
+================================================================================
+  HOW TO VERIFY THE C EXTENSION IS LOADED
+================================================================================
+
+Method 1: Check at import time
+──────────────────────────────
+  Run this Python snippet:
+
+    from fmm_helmholtz_2d import FMMOperator
+    lib = FMMOperator._load_c_lib()
+    if lib is not None:
+        print(f"C extension loaded: {lib}")
+    else:
+        print("C extension NOT found — using Python fallback")
+
+Method 2: Check file existence
+──────────────────────────────
+  The C extension must be in one of these locations:
+    ./fmm_near.so                          (current working directory)
+    <same dir as fmm_helmholtz_2d.py>/fmm_near.so
+
+  On Linux/Mac:
+    ls -la fmm_near.so
+    file fmm_near.so    # should say "ELF 64-bit LSB shared object"
+
+Method 3: Recompile if needed
+─────────────────────────────
+  If the .so was compiled on a different machine (different glibc, different
+  arch), it won't load. Recompile on the target machine:
+
+    gcc -O3 -shared -fPIC -o fmm_near.so fmm_near.c -lm
+
+  Requirements: gcc, libm (standard on any Linux). No other dependencies.
+
+  On Mac:
+    clang -O3 -shared -fPIC -o fmm_near.so fmm_near.c -lm
+
+  On HPC with modules:
+    module load gcc
+    gcc -O3 -shared -fPIC -o fmm_near.so fmm_near.c -lm
+
+Method 4: Timing test
+─────────────────────
+  Build an FMM operator and check the build time. With the C extension,
+  real-k operators build 2-3× faster than complex-k operators of the
+  same size. Without it, they take the same time.
+
+    from fmm_helmholtz_2d import FMMOperator
+    import time
+
+    # real k (should be fast with C extension)
+    t0 = time.time()
+    op1 = FMMOperator(mesh, k_real, False, n_digits=6)
+    t_real = time.time() - t0
+
+    # complex k (always uses Python)
+    t0 = time.time()
+    op2 = FMMOperator(mesh, k_complex, False, n_digits=6)
+    t_complex = time.time() - t0
+
+    ratio = t_complex / t_real
+    print(f"Real k: {t_real:.2f}s, Complex k: {t_complex:.2f}s, Ratio: {ratio:.1f}x")
+    # With C extension: ratio > 2.0
+    # Without: ratio ≈ 1.0
+
+
+================================================================================
+  DECISION FLOWCHART
+================================================================================
+
+  Start
+    │
+    ├─ N < 500 panels?
+    │    └─ YES → use "auto" (LU). FMM overhead not worth it.
+    │
+    ├─ N = 500-2000, sweeping 50+ angles?
+    │    └─ YES → use "direct". LU amortizes across angles.
+    │
+    ├─ N = 500-2000, few angles (< 10)?
+    │    ├─ TM PEC/IBC? → try "fmm", compare timing to "auto"
+    │    └─ Other? → use "auto"
+    │
+    ├─ N > 2000?
+    │    ├─ TM PEC/IBC? → use "fmm" (clear winner)
+    │    └─ Multi-region? → use "fmm" (faster build, but GMRES
+    │         convergence depends on material contrast)
+    │
+    └─ Not sure? → use "auto". It never makes a bad choice,
+         it just doesn't pick FMM for you.
+
+
+================================================================================
+  EXPECTED TIMING (fin_bumper geometry)
+================================================================================
+
+  Freq    Panels    LU total    FMM build    FMM per angle    FMM total (2 angles)
+  ────    ──────    ────────    ─────────    ─────────────    ────────────────────
+  1 GHz     356       84 s        30 s          ~40 s              ~110 s
+  5 GHz     644      ~210 s       ~60 s         ~50 s              ~160 s
+  10 GHz   1088      ~600 s      ~100 s         ~60 s              ~220 s
+  18 GHz   2000     ~2000 s      ~200 s         ~80 s              ~360 s
+
+  At 10+ GHz, FMM saves significant time. Below 5 GHz, LU is faster
+  because its per-angle cost is near zero after factorization.
+
+
+================================================================================
+  SUMMARY
+================================================================================
+
+  Method     Best for                        Residual     C backend
+  ──────     ────────                        ────────     ─────────
+  auto       Default, safe choice            10⁻¹⁵       No
+  direct     Many angles, N < 2000           10⁻¹⁵       No
+  gmres      Few angles, N > 3000            10⁻¹⁰       No
+  fmm        N > 1000, TM PEC/IBC            10⁻⁶        Yes (real k only)
+
+  The C backend (fmm_near.so) only matters when solver_method = "fmm".
+  It has no effect on "auto", "direct", or "gmres" — those methods use
+  the pure-Python dense assembly which is already vectorized with numpy.
+
+================================================================================
